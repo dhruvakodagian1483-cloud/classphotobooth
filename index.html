@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#111111">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; style-src 'unsafe-inline'; img-src 'self' blob: data:; media-src 'self' blob: data:; connect-src 'self' https://cdn.jsdelivr.net https://storage.googleapis.com; worker-src 'self' blob:; manifest-src 'self'; base-uri 'none'; form-action 'none'">
+<title>Class Photo Booth</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#111;color:#eee;font:15px system-ui,sans-serif}
+#stage{position:relative;width:100%;max-width:700px;margin:auto;background:#000}
+video,canvas#o{display:block;width:100%}canvas#o{position:absolute;inset:0;height:100%}
+#big{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:120px;font-weight:700;color:#fff;text-shadow:0 0 12px #000;pointer-events:none}
+#flash{position:absolute;inset:0;background:#fff;opacity:0;pointer-events:none}
+#st{padding:8px 12px;text-align:center;font-weight:600;background:#222;max-width:700px;margin:auto}
+.p{max-width:700px;margin:auto;padding:10px;display:grid;grid-template-columns:1fr 1fr;gap:8px}
+label{display:flex;flex-direction:column;font-size:12px;color:#aaa;gap:3px}label.c{flex-direction:row;align-items:center;font-size:14px;color:#eee}
+input,select,button{font:inherit;padding:9px;border-radius:8px;border:1px solid #444;background:#222;color:#eee}
+button{background:#2b6;border:0;font-weight:600}button.g{background:#444}button.r{background:#c33}
+.w{grid-column:1/3}#cnt{grid-column:1/3;text-align:center;color:#aaa;font-size:13px}
+#th{display:flex;gap:4px;overflow-x:auto;max-width:700px;margin:auto;padding:0 10px 20px}#th img{height:60px;border-radius:4px}
+</style></head><body>
+<div id="stage"><video id="v" playsinline muted autoplay></video><canvas id="o"></canvas><div id="big"></div><div id="flash"></div></div>
+<div id="st">Loading pose model…</div>
+<div class="p">
+<label>Mode<select id="mode"><option value="auto">Auto: click when person matches outline</option><option value="int">Interval: click every N seconds</option></select></label>
+<label>Camera<select id="cam"><option value="environment">Back</option><option value="user">Front</option></select></label>
+<label>Hold still (sec), auto mode<input id="hold" type="number" value="5" min="1" max="30"></label>
+<label>Interval (sec), interval mode<input id="intv" type="number" value="20" min="3" max="600"></label>
+<label>Interval mode requires<select id="req"><option value="none">Nothing (just click)</option><option value="person">Person visible</option><option value="match">Outline match</option></select></label>
+<label>Match tolerance (higher = looser)<input id="tol" type="range" min="0.03" max="0.2" step="0.01" value="0.08"></label>
+<label>File prefix (e.g. 10A_)<input id="pre" maxlength="20" placeholder="optional"></label>
+<label>Next photo number<input id="num" type="number" value="1" min="1" max="9999"></label>
+<label class="c w"><input id="snd" type="checkbox" checked>&nbsp;Beep sound (iPhone: also works on silent)</label>
+<button id="ref" class="g w">1. Set outline from person standing now</button>
+<button id="go" class="w">2. Start</button>
+<button id="snap" class="g">📷 Click now</button><button id="undo" class="g">↩ Delete last &amp; retake</button>
+<button id="zip">⬇ Download all (zip)</button><button id="clr" class="r">Clear all photos</button>
+<div id="cnt"></div>
+</div>
+<div id="th"></div>
+<script type="module">
+import {PoseLandmarker,FilesetResolver} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm";
+const WASM="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm",
+MODEL="https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+const $=id=>document.getElementById(id),v=$('v'),o=$('o'),ctx=o.getContext('2d'),st=$('st'),big=$('big');
+const num=(id,lo,hi,d)=>{const x=parseFloat($(id).value);return Number.isFinite(x)?Math.min(hi,Math.max(lo,x)):d};
+const hold=()=>num('hold',1,30,5),intv=()=>num('intv',3,600,20),tol=()=>num('tol',.03,.2,.08),pn=()=>Math.floor(num('num',1,9999,1));
+const prefix=()=>($('pre').value||'').replace(/[^\w-]/g,'_').slice(0,20);
+const KEY=[0,11,12,23,24];
+let pose,ref=null,running=false,state='armed',t0=0,lastOk=0,clr=null,next=0,lastBeep=-1,lastLm=null,lastT=-1,hist=[],msgUntil=0,wl=null,mem=[],db=null;
+const msg=(t,ms=2000)=>{st.textContent=t;msgUntil=performance.now()+ms};
+const status=t=>{if(performance.now()>msgUntil)st.textContent=t};
+const okRef=r=>r&&typeof r.cam==='string'&&Array.isArray(r.pts)&&r.pts.length===33&&r.pts.every(p=>p&&Number.isFinite(p.x)&&Number.isFinite(p.y)&&p.x>-1&&p.x<2&&p.y>-1&&p.y<2);
+try{const r=JSON.parse(localStorage.getItem('ref'));if(okRef(r))ref=r}catch(e){}
+/* ---- sound: HTML audio element (not blocked by iPhone silent switch) ---- */
+const au=new Audio(),tones={};
+function wav(f,d){const sr=8000,n=sr*d|0,b=new DataView(new ArrayBuffer(44+n*2)),w=(o,s)=>[...s].forEach((c,i)=>b.setUint8(o+i,c.charCodeAt(0)));
+ w(0,'RIFF');b.setUint32(4,36+n*2,true);w(8,'WAVEfmt ');b.setUint32(16,16,true);b.setUint16(20,1,true);b.setUint16(22,1,true);b.setUint32(24,sr,true);b.setUint32(28,sr*2,true);b.setUint16(32,2,true);b.setUint16(34,16,true);w(36,'data');b.setUint32(40,n*2,true);
+ for(let i=0;i<n;i++)b.setInt16(44+i*2,Math.sin(2*Math.PI*f*i/sr)*9000*(1-i/n),true);return new Blob([b],{type:'audio/wav'})}
+function beep(f=660,d=.12){if(!$('snd').checked)return;const k=f+'_'+d;if(!tones[k])tones[k]=URL.createObjectURL(wav(f,d));au.src=tones[k];au.play().catch(()=>{})}
+/* ---- camera ---- */
+function stopCam(){v.srcObject&&v.srcObject.getTracks().forEach(t=>t.stop());v.srcObject=null}
+async function cam(){stopCam();v.srcObject=await navigator.mediaDevices.getUserMedia({video:{facingMode:$('cam').value,width:{ideal:1920},height:{ideal:1080}},audio:false});await v.play()}
+$('cam').onchange=async()=>{ref=null;try{localStorage.removeItem('ref')}catch(e){}try{await cam();msg('Camera changed: set the outline again',3000)}catch(e){msg('Camera blocked',5000)}};
+/* ---- photo store (IndexedDB mirror of `mem`) ---- */
+const openDb=()=>new Promise(res=>{try{const r=indexedDB.open('booth',1);r.onupgradeneeded=()=>r.result.createObjectStore('p',{keyPath:'name'});r.onsuccess=()=>res(r.result);r.onerror=()=>res(null)}catch(e){res(null)}});
+const tx=(m,f)=>new Promise(res=>{if(!db)return res(null);try{const t=db.transaction('p',m),q=f(t.objectStore('p'));t.oncomplete=()=>res(q&&q.result);t.onerror=t.onabort=()=>res(null)}catch(e){res(null)}});
+const urls=new Map();
+function render(){const th=$('th');th.textContent='';const last=mem.slice(-8).reverse();
+ for(const p of last){let u=urls.get(p);if(!u)urls.set(p,u=URL.createObjectURL(p.blob));const im=new Image();im.src=u;im.alt=p.name;im.onclick=()=>window.open(u);th.append(im)}
+ for(const [p,u] of urls)if(!last.includes(p)){URL.revokeObjectURL(u);urls.delete(p)}
+ $('cnt').textContent=mem.length+' photos saved on this phone only'}
+async function save(name,blob){const p={name,blob,t:Date.now()};mem=mem.filter(x=>x.name!==name);mem.push(p);await tx('readwrite',s=>s.put(p));render()}
+$('undo').onclick=async()=>{const p=mem.pop();if(!p)return;await tx('readwrite',s=>s.delete(p.name));const m=p.name.match(/(\d+)\.jpg$/);if(m)$('num').value=+m[1];state='armed';render();msg('Last photo deleted. Retake now.',2500)};
+$('clr').onclick=async()=>{if(!mem.length||!confirm('Delete ALL saved photos from this phone?'))return;mem=[];await tx('readwrite',s=>s.clear());render()};
+/* ---- zip (store-only, no library) ---- */
+const crcT=(()=>{const t=[];for(let n=0;n<256;n++){let c=n;for(let k=0;k<8;k++)c=c&1?0xEDB88320^(c>>>1):c>>>1;t[n]=c>>>0}return t})();
+const crc=u=>{let c=-1;for(let i=0;i<u.length;i++)c=crcT[(c^u[i])&255]^(c>>>8);return(c^-1)>>>0};
+$('zip').onclick=async()=>{
+ if(!mem.length)return msg('No photos yet');msg('Building zip…',5000);
+ const parts=[],cd=[],enc=new TextEncoder(),DT=((2024-1980)<<9)|(1<<5)|1;let off=0,cs=0;
+ for(const p of mem){const data=new Uint8Array(await p.blob.arrayBuffer()),nm=enc.encode(p.name),c=crc(data);
+  const h=new DataView(new ArrayBuffer(30));h.setUint32(0,0x04034b50,true);h.setUint16(4,20,true);h.setUint16(12,DT,true);h.setUint32(14,c,true);h.setUint32(18,data.length,true);h.setUint32(22,data.length,true);h.setUint16(26,nm.length,true);
+  const d=new DataView(new ArrayBuffer(46));d.setUint32(0,0x02014b50,true);d.setUint16(4,20,true);d.setUint16(6,20,true);d.setUint16(14,DT,true);d.setUint32(16,c,true);d.setUint32(20,data.length,true);d.setUint32(24,data.length,true);d.setUint16(28,nm.length,true);d.setUint32(42,off,true);
+  parts.push(h,nm,data);cd.push(d,nm);off+=30+nm.length+data.length;cs+=46+nm.length}
+ const e=new DataView(new ArrayBuffer(22));e.setUint32(0,0x06054b50,true);e.setUint16(8,mem.length,true);e.setUint16(10,mem.length,true);e.setUint32(12,cs,true);e.setUint32(16,off,true);
+ const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([...parts,...cd,e],{type:'application/zip'}));
+ a.download='class-photos-'+new Date().toISOString().slice(0,10)+'.zip';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),60000);msg('Zip ready. Clear photos after saving it.',4000)};
+/* ---- pose logic ---- */
+const asp=()=>v.videoWidth/v.videoHeight;
+const dist=(a,b)=>Math.hypot((a.x-b.x)*asp(),a.y-b.y);
+function score(lm){let s=0,n=0;for(const i of KEY){const r=ref.pts[i];if((r.visibility??1)<.5)continue;if((lm[i].visibility??1)<.3)return Infinity;s+=dist(r,lm[i]);n++}return n>2?s/n:Infinity}
+function pick(list){if(!list||!list.length)return null;
+ if(ref)return list.reduce((a,b)=>score(b)<score(a)?b:a);
+ return list.reduce((a,b)=>Math.abs(b[11].x-b[12].x)>Math.abs(a[11].x-a[12].x)?b:a)}
+function stable(lm,now){const c={x:0,y:0};for(const i of KEY){c.x+=lm[i].x/KEY.length;c.y+=lm[i].y/KEY.length}
+ hist.push({t:now,x:c.x,y:c.y});while(hist.length&&now-hist[0].t>600)hist.shift();return hist.every(h=>dist(h,c)<.02)}
+function draw(pts,col,w,a){if(!pts)return;ctx.globalAlpha=a;ctx.strokeStyle=col;ctx.lineWidth=w;ctx.lineCap='round';
+ for(const c of PoseLandmarker.POSE_CONNECTIONS){const p=pts[c.start],q=pts[c.end];if((p.visibility??1)<.4||(q.visibility??1)<.4)continue;
+  ctx.beginPath();ctx.moveTo(p.x*o.width,p.y*o.height);ctx.lineTo(q.x*o.width,q.y*o.height);ctx.stroke()}ctx.globalAlpha=1}
+function flash(){const f=$('flash');f.style.transition='none';f.style.opacity=.9;setTimeout(()=>{f.style.transition='opacity .4s';f.style.opacity=0},50)}
+async function shoot(){
+ const c=document.createElement('canvas');c.width=v.videoWidth;c.height=v.videoHeight;c.getContext('2d').drawImage(v,0,0);
+ const n=pn(),name=prefix()+String(n).padStart(3,'0')+'.jpg';$('num').value=n+1;flash();beep(1200,.25);navigator.vibrate&&navigator.vibrate(60);
+ const b=await new Promise(r=>c.toBlob(r,'image/jpeg',.92));await save(name,b)}
+function tick(s){const k=Math.ceil(s);big.textContent=k>0&&k<=3?k:'';if(k>0&&k<=3&&k!==lastBeep){lastBeep=k;beep(660,.12)}}
+function auto(m,stb,now){
+ if(!ref)return status('Set the outline first');
+ if(state==='armed'){status('Waiting for next person…');big.textContent='';if(m){state='count';t0=lastOk=now;lastBeep=-1}}
+ else if(state==='count'){
+  if(m&&stb)lastOk=now;
+  if(!m||now-lastOk>1000){state='armed';big.textContent='';return msg('Moved! Hold still and try again',1500)}
+  const rem=hold()-(now-t0)/1000;tick(rem);status('Hold still…');
+  if(rem<=0&&stb){big.textContent='';state='cool';clr=null;shoot();msg('Done! Next person please',2500)}
+ }else{if(!m||!stb){clr=clr||now;if(now-clr>1000)state='armed'}else clr=null}
+}
+function interval(lm,m,now){
+ const rq=$('req').value;if(rq==='match'&&!ref)return status('Set the outline first');
+ const rem=(next-now)/1000;tick(rem);status('Next photo in '+Math.max(0,Math.ceil(rem))+'s');if(rem>0)return;
+ big.textContent='';lastBeep=-1;
+ if(rq==='none'||(rq==='person'&&lm)||(rq==='match'&&m)){shoot();next=now+intv()*1000}
+ else{next=now+3000;msg('Nobody in position, retrying in 3s',2500)}
+}
+function loop(){
+ requestAnimationFrame(loop);
+ if(!pose||!v.srcObject||v.readyState<2||v.currentTime===lastT)return;lastT=v.currentTime;
+ if(o.width!==v.videoWidth){o.width=v.videoWidth;o.height=v.videoHeight}
+ let list;try{list=pose.detectForVideo(v,performance.now()).landmarks}catch(e){return msg('Detection error: '+e.message,9999)}
+ const lm=pick(list),now=performance.now();lastLm=lm;
+ ctx.clearRect(0,0,o.width,o.height);if(ref)draw(ref.pts,'#2f6',10,.45);draw(lm,'#fff',4,.9);
+ const m=!!(lm&&ref&&score(lm)<tol()),stb=lm?stable(lm,now):(hist=[],false);
+ if(!running){big.textContent='';return}
+ $('mode').value==='auto'?auto(m,stb,now):interval(lm,m,now);
+}
+/* ---- controls ---- */
+async function lock(){unlock();try{wl=await navigator.wakeLock.request('screen')}catch(e){}}
+function unlock(){try{wl&&wl.release()}catch(e){}wl=null}
+function setRun(r){running=r;$('go').textContent=r?'Stop':'2. Start';$('go').className='w '+(r?'r':'');state='armed';clr=null;next=performance.now()+intv()*1000;lastBeep=-1;big.textContent='';r?lock():(unlock(),msg('Stopped',1500))}
+$('go').onclick=()=>{if(!running)beep(660,.05);setRun(!running)};
+$('mode').onchange=()=>{if(running)setRun(true)};
+$('snap').onclick=()=>{if(!v.srcObject)return;beep(660,.05);shoot()};
+$('ref').onclick=()=>{if(!lastLm)return msg('No person detected. Step into view.');
+ ref={cam:$('cam').value,pts:lastLm.map(p=>({x:p.x,y:p.y,visibility:p.visibility}))};
+ try{localStorage.setItem('ref',JSON.stringify(ref))}catch(e){}msg('Outline saved (green). Press Start.',3000)};
+document.addEventListener('visibilitychange',async()=>{
+ if(!pose)return;
+ if(document.hidden){stopCam();unlock();return}
+ try{await cam();if(running){state='armed';next=performance.now()+intv()*1000;lock()}}catch(e){msg('Camera blocked',5000)}});
+/* ---- init ---- */
+const mk=(fs,delegate)=>PoseLandmarker.createFromOptions(fs,{baseOptions:{modelAssetPath:MODEL,delegate},runningMode:"VIDEO",numPoses:3});
+async function init(){
+ db=await openDb();const all=await tx('readonly',s=>s.getAll());
+ mem=(all||[]).filter(p=>p&&typeof p.name==='string'&&p.blob instanceof Blob).sort((a,b)=>a.t-b.t);render();
+ if(!isSecureContext||!navigator.mediaDevices)return st.textContent='Camera needs https. Host it on GitHub Pages (not file://).';
+ try{await cam()}catch(e){return st.textContent='Camera blocked: allow camera access and reload.'}
+ if(ref&&ref.cam!==$('cam').value)ref=null;
+ try{const fs=await FilesetResolver.forVisionTasks(WASM);try{pose=await mk(fs,'GPU')}catch(e){pose=await mk(fs,'CPU')}}
+ catch(e){return st.textContent='Could not load pose model (internet?): '+e.message}
+ st.textContent=ref?'Outline loaded. Press Start.':'Place first student, then set outline.';loop();
+}
+if('serviceWorker' in navigator&&location.protocol==='https:')navigator.serviceWorker.register('sw.js').catch(()=>{});
+init();
+</script></body></html>
